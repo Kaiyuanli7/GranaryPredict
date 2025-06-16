@@ -217,6 +217,7 @@ def main():
         options=["RandomForest", "HistGradientBoosting", "LightGBM"],
         index=0,
     )
+    n_trees = st.sidebar.slider("Model iterations/trees", min_value=100, max_value=1000, step=100, value=300)
     example_btn = st.sidebar.button("Train model on uploaded CSV")
     if example_btn and uploaded_file:
         df = load_uploaded_file(uploaded_file)
@@ -229,14 +230,14 @@ def main():
         X_eval, y_eval = features.select_feature_target(df_eval)
         csv_stem = pathlib.Path(uploaded_file.name).stem.replace(" ", "_").lower()
         if model_choice == "RandomForest":
-            mdl, metrics = model_utils.train_random_forest(X_train, y_train)
-            model_name = f"{csv_stem}_rf.joblib"
+            mdl, metrics = model_utils.train_random_forest(X_train, y_train, n_estimators=n_trees)
+            model_name = f"{csv_stem}_rf_{n_trees}.joblib"
         elif model_choice == "HistGradientBoosting":
-            mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist")
-            model_name = f"{csv_stem}_hgb.joblib"
+            mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist", n_estimators=n_trees)
+            model_name = f"{csv_stem}_hgb_{n_trees}.joblib"
         else:
-            mdl, metrics = model_utils.train_lightgbm(X_train, y_train)
-            model_name = f"{csv_stem}_lgbm.joblib"
+            mdl, metrics = model_utils.train_lightgbm(X_train, y_train, n_estimators=n_trees)
+            model_name = f"{csv_stem}_lgbm_{n_trees}.joblib"
         model_utils.save_model(mdl, name=model_name)
         st.sidebar.success(
             f"{model_choice} trained! MAE: {metrics.get('mae', metrics.get('mae_cv')):.2f}, "
@@ -333,6 +334,33 @@ def main():
 
                 with ts_tab:
                     plot_time_series(df_predplot_all, key=f"time_{tab_label}")
+
+    # --------------------------------------------------
+    # Downloads section for easy access
+    with st.sidebar.expander("📥 Downloads", expanded=False):
+        st.caption("Saved models:")
+        for mdl_path in MODELS_DIR.glob("*.joblib"):
+            with open(mdl_path, "rb") as f:
+                st.download_button(
+                    label=mdl_path.name,
+                    data=f,
+                    file_name=mdl_path.name,
+                    mime="application/octet-stream",
+                )
+
+        st.caption("Processed data files:")
+        processed_dir = pathlib.Path("data/processed")
+        if processed_dir.exists():
+            for csv_file in processed_dir.glob("*.csv"):
+                with open(csv_file, "rb") as f:
+                    st.download_button(
+                        label=csv_file.name,
+                        data=f,
+                        file_name=csv_file.name,
+                        mime="text/csv",
+                    )
+        else:
+            st.write("No processed CSVs found.")
 
 
 if __name__ == "__main__":
