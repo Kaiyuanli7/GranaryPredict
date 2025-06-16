@@ -14,9 +14,7 @@ from granarypredict import ingestion
 
 from sklearn.metrics import r2_score
 
-st.set_page_config(page_title="GranaryPredict Dashboard", layout="wide")
-
-st.title("🌾 GranaryPredict – Temperature Forecasting")
+st.set_page_config(page_title="GranaryPredict", layout="wide")
 
 def load_uploaded_file(uploaded_file) -> pd.DataFrame:
     """Read uploaded CSV safely, rewinding pointer and handling encoding."""
@@ -149,11 +147,22 @@ def forecast_summary(df_eval: pd.DataFrame) -> pd.DataFrame:
     return grp
 
 
+def compute_overall_metrics(df_eval: pd.DataFrame) -> tuple[float, float]:
+    """Return (confidence %, accuracy %) or (nan, nan) if not computable."""
+    if {"temperature_grain", "predicted_temp"}.issubset(df_eval.columns) and not df_eval.empty:
+        r2 = r2_score(df_eval["temperature_grain"], df_eval["predicted_temp"])
+        conf = max(0, min(100, r2 * 100))
+        avg_pct_err = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs() / df_eval["temperature_grain"]).mean() * 100
+        acc = max(0, 100 - avg_pct_err)
+        return conf, acc
+    return float("nan"), float("nan")
+
+
 def main():
     st.session_state.setdefault("evaluations", {})
 
-    st.sidebar.header("1️⃣ Upload sensor CSV")
-    uploaded_file = st.sidebar.file_uploader("Sensor CSV", type=["csv"])
+    with st.sidebar.expander("📂 Upload Data", expanded=("uploaded_file" not in st.session_state)):
+        uploaded_file = st.file_uploader("", type=["csv"], key="uploader")
 
     if uploaded_file:
         df = load_uploaded_file(uploaded_file)
@@ -170,89 +179,55 @@ def main():
         # Feature engineering
         df = features.create_time_features(df)
         df = features.create_spatial_features(df)
-        df_train, df_eval = split_train_eval(df, horizon=5)
-        X_train, y_train = features.select_feature_target(df_train)
-        X_eval, y_eval = features.select_feature_target(df_eval)
 
-        # Alerts
-        if "predicted_temp" in df_eval.columns:
-            alerts = df_eval[df_eval["predicted_temp"] >= ALERT_TEMP_THRESHOLD]
-            if not alerts.empty:
-                st.error(f"⚠️ {len(alerts)} positions predicted above {ALERT_TEMP_THRESHOLD}°C")
+        with st.sidebar.expander("🏗️ Train / Retrain Model", expanded=False):
+            model_choice = st.selectbox(
+                "Algorithm",
+                ["RandomForest", "HistGradientBoosting", "LightGBM"],
+                index=0,
+            )
+            pred_mode = st.radio("Prediction mode", ["Backtest", "Forecast"], index=0)
+            horizon_days = st.slider("Horizon (days)", 1, 30, 5)
+            n_trees = st.slider("Iterations / Trees", 100, 1000, 300, step=100)
+            train_pressed = st.button("Train on uploaded CSV")
 
-        # Summary per forecast day
-        if "forecast_day" in df_eval.columns and "predicted_temp" in df_eval.columns:
-            st.subheader("Forecast Summary (per day)")
-            st.dataframe(forecast_summary(df_eval), use_container_width=True)
+        if train_pressed and uploaded_file:
+            df = load_uploaded_file(uploaded_file)
+            df = cleaning.basic_clean(df)
+            df = cleaning.fill_missing(df)
+            df = features.create_time_features(df)
+            df = features.create_spatial_features(df)
+            df_train, df_eval = split_train_eval(df, horizon=horizon_days)
+            X_train, y_train = features.select_feature_target(df_train)
+            X_eval, y_eval = features.select_feature_target(df_eval)
+            csv_stem = pathlib.Path(uploaded_file.name).stem.replace(" ", "_").lower()
+            if model_choice == "RandomForest":
+                mdl, metrics = model_utils.train_random_forest(X_train, y_train, n_estimators=n_trees)
+                model_name = f"{csv_stem}_rf_{n_trees}.joblib"
+            elif model_choice == "HistGradientBoosting":
+                mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist", n_estimators=n_trees)
+                model_name = f"{csv_stem}_hgb_{n_trees}.joblib"
+            else:
+                mdl, metrics = model_utils.train_lightgbm(X_train, y_train, n_estimators=n_trees)
+                model_name = f"{csv_stem}_lgbm_{n_trees}.joblib"
+            model_utils.save_model(mdl, name=model_name)
+            st.sidebar.success(
+                f"{model_choice} trained! MAE: {metrics.get('mae', metrics.get('mae_cv')):.2f}, "
+                f"RMSE: {metrics.get('rmse', metrics.get('rmse_cv')):.2f}"
+            )
 
-            # Overall confidence across evaluation horizon
-            if {"temperature_grain", "predicted_temp"}.issubset(df_eval.columns):
-                if len(df_eval) > 1:
-                    overall_r2 = r2_score(df_eval["temperature_grain"], df_eval["predicted_temp"])
-                    overall_conf = max(0, min(100, overall_r2 * 100))
-                    st.metric("Overall Confidence (%)", f"{overall_conf:.0f}")
+        # Existing model evaluation
+        with st.sidebar.expander("🔍 Evaluate Model", expanded=False):
+            model_files = list_saved_models()
+            if not model_files:
+                st.write("No saved models yet.")
+                eval_pressed = False
+                selected_model = None
+            else:
+                selected_model = st.selectbox("Model file", model_files)
+                eval_pressed = st.button("Evaluate")
 
-        if "predicted_temp" in df_eval.columns:
-            st.subheader("Predictions")
-            with st.expander("Show full prediction table"):
-                st.dataframe(df_eval, use_container_width=True)
-
-            st.subheader("3D Grid Temperatures")
-            plot_3d_grid(df_eval, key="grid_main")
-
-            st.subheader("Time Series Comparison")
-            plot_time_series(df_predplot_all, key="time_main")
-
-        if {"temperature_grain", "predicted_temp"}.issubset(df_eval.columns):
-            mae = (df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs().mean()
-            rmse = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]) ** 2).mean() ** 0.5
-            r2 = r2_score(df_eval["temperature_grain"], df_eval["predicted_temp"])
-            conf = max(0, min(100, r2 * 100))
-            st.metric("Confidence (%)", f"{conf:.0f}")
-            st.caption(f"MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-
-    st.sidebar.header("2️⃣ Model selection & training")
-    model_choice = st.sidebar.selectbox(
-        "Choose model",
-        options=["RandomForest", "HistGradientBoosting", "LightGBM"],
-        index=0,
-    )
-    n_trees = st.sidebar.slider("Model iterations/trees", min_value=100, max_value=1000, step=100, value=300)
-    example_btn = st.sidebar.button("Train model on uploaded CSV")
-    if example_btn and uploaded_file:
-        df = load_uploaded_file(uploaded_file)
-        df = cleaning.basic_clean(df)
-        df = cleaning.fill_missing(df)
-        df = features.create_time_features(df)
-        df = features.create_spatial_features(df)
-        df_train, df_eval = split_train_eval(df, horizon=5)
-        X_train, y_train = features.select_feature_target(df_train)
-        X_eval, y_eval = features.select_feature_target(df_eval)
-        csv_stem = pathlib.Path(uploaded_file.name).stem.replace(" ", "_").lower()
-        if model_choice == "RandomForest":
-            mdl, metrics = model_utils.train_random_forest(X_train, y_train, n_estimators=n_trees)
-            model_name = f"{csv_stem}_rf_{n_trees}.joblib"
-        elif model_choice == "HistGradientBoosting":
-            mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist", n_estimators=n_trees)
-            model_name = f"{csv_stem}_hgb_{n_trees}.joblib"
-        else:
-            mdl, metrics = model_utils.train_lightgbm(X_train, y_train, n_estimators=n_trees)
-            model_name = f"{csv_stem}_lgbm_{n_trees}.joblib"
-        model_utils.save_model(mdl, name=model_name)
-        st.sidebar.success(
-            f"{model_choice} trained! MAE: {metrics.get('mae', metrics.get('mae_cv')):.2f}, "
-            f"RMSE: {metrics.get('rmse', metrics.get('rmse_cv')):.2f}"
-        )
-
-    # Existing model evaluation
-    st.sidebar.header("3️⃣ Evaluate existing model")
-    model_files = list_saved_models()
-    if not model_files:
-        st.sidebar.info("No saved models in models/ directory yet.")
-    else:
-        selected_model = st.sidebar.selectbox("Choose model file", model_files)
-        eval_btn = st.sidebar.button("Evaluate selected model", key="eval")
-        if eval_btn:
+        if eval_pressed and selected_model:
             if uploaded_file is None:
                 st.warning("Please upload a CSV first to evaluate.")
             else:
@@ -268,11 +243,16 @@ def main():
                 mdl = load_trained_model(MODELS_DIR / selected_model)
                 if mdl:
                     X_eval_aligned = X_eval.reindex(columns=X_train.columns, fill_value=0)
-                    preds = model_utils.predict(mdl, X_eval_aligned)
-                    df_eval["predicted_temp"] = preds
-                    df_predplot_all = pd.concat([df_eval, df_train], ignore_index=True)
-                    # store all data; day selection will happen in tab
-                    df_predplot = df_predplot_all
+                    if pred_mode == "Backtest":
+                        preds = model_utils.predict(mdl, X_eval_aligned)
+                        df_eval["predicted_temp"] = preds
+                        df_predplot_all = pd.concat([df_eval, df_train], ignore_index=True)
+                    else:
+                        future_df = make_future(df_train, horizon_days)
+                        X_future, _ = features.select_feature_target(future_df)
+                        X_future = X_future.reindex(columns=X_train.columns, fill_value=0)
+                        future_df["predicted_temp"] = model_utils.predict(mdl, X_future)
+                        df_predplot_all = future_df
 
                     # Compute metrics if ground truth available
                     if "temperature_grain" in df.columns:
@@ -283,9 +263,12 @@ def main():
                         st.info("Ground truth temperature_grain not found; showing predictions only.")
 
                     # Store results in session_state and acknowledge
+                    conf, acc = compute_overall_metrics(df_eval)
                     st.session_state["evaluations"][selected_model] = {
                         "df_eval": df_eval,
                         "df_predplot_all": df_predplot_all,
+                        "confidence": conf,
+                        "accuracy": acc,
                     }
                     st.sidebar.success(f"Evaluation stored for {selected_model}.")
                 else:
@@ -361,6 +344,18 @@ def main():
                     )
         else:
             st.write("No processed CSVs found.")
+
+    # Leaderboard
+    with st.sidebar.expander("🏆 Model Leaderboard", expanded=False):
+        evals = st.session_state["evaluations"]
+        if not evals:
+            st.write("No evaluations yet.")
+        else:
+            data = []
+            for name, d in evals.items():
+                data.append({"model": name, "confidence": d.get("confidence", float("nan")), "accuracy": d.get("accuracy", float("nan"))})
+            df_leader = pd.DataFrame(data).sort_values(["confidence", "accuracy"], ascending=False).reset_index(drop=True)
+            st.dataframe(df_leader, use_container_width=True)
 
 
 if __name__ == "__main__":
