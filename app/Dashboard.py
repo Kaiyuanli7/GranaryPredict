@@ -45,7 +45,7 @@ def load_trained_model(path: Optional[str] = None):
     return None
 
 
-def plot_3d_grid(df: pd.DataFrame):
+def plot_3d_grid(df: pd.DataFrame, *, key: str):
     required_cols = {"grid_x", "grid_y", "grid_z", "temperature_grain"}
     if not required_cols.issubset(df.columns):
         st.info("No spatial temperature data present.")
@@ -88,7 +88,7 @@ def plot_3d_grid(df: pd.DataFrame):
         height=600,
         margin=dict(l=0, r=0, b=0, t=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
 def plot_time_series(df: pd.DataFrame, *, key: str):
@@ -198,7 +198,7 @@ def main():
                 st.dataframe(df_eval, use_container_width=True)
 
             st.subheader("3D Grid Temperatures")
-            plot_3d_grid(df_eval)
+            plot_3d_grid(df_eval, key="grid_main")
 
             st.subheader("Time Series Comparison")
             plot_time_series(df_predplot_all, key="time_main")
@@ -227,15 +227,16 @@ def main():
         df_train, df_eval = split_train_eval(df, horizon=5)
         X_train, y_train = features.select_feature_target(df_train)
         X_eval, y_eval = features.select_feature_target(df_eval)
+        csv_stem = pathlib.Path(uploaded_file.name).stem.replace(" ", "_").lower()
         if model_choice == "RandomForest":
             mdl, metrics = model_utils.train_random_forest(X_train, y_train)
-            model_name = "rf_model.joblib"
+            model_name = f"{csv_stem}_rf.joblib"
         elif model_choice == "HistGradientBoosting":
             mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist")
-            model_name = "hgb_model.joblib"
+            model_name = f"{csv_stem}_hgb.joblib"
         else:
             mdl, metrics = model_utils.train_lightgbm(X_train, y_train)
-            model_name = "lgbm_model.joblib"
+            model_name = f"{csv_stem}_lgbm.joblib"
         model_utils.save_model(mdl, name=model_name)
         st.sidebar.success(
             f"{model_choice} trained! MAE: {metrics.get('mae', metrics.get('mae_cv')):.2f}, "
@@ -265,7 +266,8 @@ def main():
 
                 mdl = load_trained_model(MODELS_DIR / selected_model)
                 if mdl:
-                    preds = model_utils.predict(mdl, X_eval)
+                    X_eval_aligned = X_eval.reindex(columns=X_train.columns, fill_value=0)
+                    preds = model_utils.predict(mdl, X_eval_aligned)
                     df_eval["predicted_temp"] = preds
                     df_predplot_all = pd.concat([df_eval, df_train], ignore_index=True)
                     # store all data; day selection will happen in tab
@@ -327,7 +329,7 @@ def main():
                     st.dataframe(df_predplot, use_container_width=True)
 
                 with grid_tab:
-                    plot_3d_grid(df_predplot)
+                    plot_3d_grid(df_predplot, key=f"grid_{tab_label}")
 
                 with ts_tab:
                     plot_time_series(df_predplot_all, key=f"time_{tab_label}")
