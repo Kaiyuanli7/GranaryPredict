@@ -10,6 +10,7 @@ from itertools import islice
 
 from granarypredict import cleaning, features, model as model_utils
 from granarypredict.config import ALERT_TEMP_THRESHOLD, MODELS_DIR
+from granarypredict import ingestion
 
 from sklearn.metrics import r2_score
 
@@ -26,7 +27,10 @@ def load_uploaded_file(uploaded_file) -> pd.DataFrame:
     except Exception:
         pass
     try:
-        return pd.read_csv(uploaded_file, encoding="utf-8")
+        df = pd.read_csv(uploaded_file, encoding="utf-8")
+        if "temp" in df.columns and "batch" in df.columns:
+            df = ingestion.standardize_result147(df)
+        return df
     except pd.errors.EmptyDataError:
         st.error("Uploaded file appears empty or unreadable. Please verify the CSV.")
         return pd.DataFrame()
@@ -210,7 +214,7 @@ def main():
     st.sidebar.header("2️⃣ Model selection & training")
     model_choice = st.sidebar.selectbox(
         "Choose model",
-        options=["RandomForest", "HistGradientBoosting"],
+        options=["RandomForest", "HistGradientBoosting", "LightGBM"],
         index=0,
     )
     example_btn = st.sidebar.button("Train model on uploaded CSV")
@@ -226,9 +230,12 @@ def main():
         if model_choice == "RandomForest":
             mdl, metrics = model_utils.train_random_forest(X_train, y_train)
             model_name = "rf_model.joblib"
-        else:
+        elif model_choice == "HistGradientBoosting":
             mdl, metrics = model_utils.train_gb_models(X_train, y_train, model_type="hist")
             model_name = "hgb_model.joblib"
+        else:
+            mdl, metrics = model_utils.train_lightgbm(X_train, y_train)
+            model_name = "lgbm_model.joblib"
         model_utils.save_model(mdl, name=model_name)
         st.sidebar.success(
             f"{model_choice} trained! MAE: {metrics.get('mae', metrics.get('mae_cv')):.2f}, "

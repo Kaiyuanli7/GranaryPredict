@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
+from lightgbm import LGBMRegressor
 
 from .config import MODELS_DIR
 from .evaluate import time_series_cv
@@ -80,6 +81,36 @@ def train_gb_models(
     return mdl, metrics
 
 
+def train_lightgbm(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    n_estimators: int = 600,
+    learning_rate: float = 0.05,
+    max_depth: int | None = -1,
+    random_state: int = 42,
+) -> Tuple[Any, Dict[str, float]]:
+    """Train LightGBM regressor."""
+    logger.info("Training LightGBM on X shape=%s", X.shape)
+    model = LGBMRegressor(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+    y_pred = model.predict(X)
+    metrics = {
+        "mae": mean_absolute_error(y, y_pred),
+        "rmse": np.sqrt(mean_squared_error(y, y_pred)),
+    }
+    logger.info("LightGBM MAE: %.3f RMSE: %.3f", metrics["mae"], metrics["rmse"])
+    return model, metrics
+
+
 def save_model(model: Any, name: str = "rf_model.joblib") -> Path:
     path = MODELS_DIR / name
     joblib.dump(model, path)
@@ -101,6 +132,7 @@ def predict(model: Any, X_future: pd.DataFrame) -> np.ndarray:
 __all__ = [
     "train_random_forest",
     "train_gb_models",
+    "train_lightgbm",
     "save_model",
     "load_model",
     "predict",

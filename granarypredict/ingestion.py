@@ -89,8 +89,33 @@ def fetch_company_data(
         return pd.DataFrame()
 
 
+def standardize_result147(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert Result_147.csv format to standard columns used in pipeline."""
+    mapping = {
+        "batch": "detection_time",
+        "temp": "temperature_grain",
+        "x": "grid_x",
+        "y": "grid_y",
+        "z": "grid_z",
+        "indoor_temp": "temperature_inside",
+        "outdoor_temp": "temperature_outside",
+        "indoor_humidity": "humidity_warehouse",
+        "outdoor_humidity": "humidity_outside",
+        "storeType": "warehouse_type",
+    }
+    df = df.rename(columns=mapping)
+    # ensure correct dtypes
+    df["detection_time"] = pd.to_datetime(df["detection_time"])
+    nums = ["temperature_grain", "temperature_inside", "temperature_outside", "humidity_warehouse", "humidity_outside"]
+    for col in nums:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 __all__ = [
     "read_granary_csv",
     "fetch_meteorology",
     "fetch_company_data",
+    "standardize_result147",
 ] 
