@@ -158,6 +158,47 @@ def compute_overall_metrics(df_eval: pd.DataFrame) -> tuple[float, float]:
     return float("nan"), float("nan")
 
 
+# --------------------------------------------------
+# Helper to build future rows for forecasting
+def make_future(df: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    """Generate a future dataframe for the next ``horizon_days`` days.
+
+    For each unique spatial location (grid_x/y/z) present in *df*, this function
+    creates ``horizon_days`` duplicated rows with the *detection_time* advanced
+    by 1..horizon_days. It also appends a *forecast_day* column (1-indexed).
+
+    The resulting frame is passed through the same feature generators so it can
+    be fed directly into the model for prediction.
+    """
+    if df.empty or "detection_time" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["detection_time"] = pd.to_datetime(df["detection_time"])
+    latest_ts = df["detection_time"].max()
+
+    # Keep the unique spatial coordinates (and any categorical IDs if present)
+    keep_cols = [c for c in df.columns if c in {"grid_x", "grid_y", "grid_z", "granary_id", "heap_id"}]
+    sensors = df[keep_cols].drop_duplicates()
+
+    frames: List[pd.DataFrame] = []
+    for d in range(1, horizon_days + 1):
+        tmp = sensors.copy()
+        tmp["detection_time"] = latest_ts + timedelta(days=d)
+        tmp["forecast_day"] = d
+        frames.append(tmp)
+
+    future_df = pd.concat(frames, ignore_index=True)
+    # Feature engineering to match training pipeline
+    future_df = features.create_time_features(future_df)
+    future_df = features.create_spatial_features(future_df)
+    # Add placeholder target column so downstream feature selector does not fail
+    if "temperature_grain" not in future_df.columns:
+        future_df["temperature_grain"] = np.nan
+    return future_df
+# --------------------------------------------------
+
+
 def main():
     st.session_state.setdefault("evaluations", {})
 
@@ -186,8 +227,6 @@ def main():
                 ["RandomForest", "HistGradientBoosting", "LightGBM"],
                 index=0,
             )
-            pred_mode = st.radio("Prediction mode", ["Backtest", "Forecast"], index=0)
-            horizon_days = st.slider("Horizon (days)", 1, 30, 5)
             n_trees = st.slider("Iterations / Trees", 100, 1000, 300, step=100)
             train_pressed = st.button("Train on uploaded CSV")
 
@@ -197,9 +236,7 @@ def main():
             df = cleaning.fill_missing(df)
             df = features.create_time_features(df)
             df = features.create_spatial_features(df)
-            df_train, df_eval = split_train_eval(df, horizon=horizon_days)
-            X_train, y_train = features.select_feature_target(df_train)
-            X_eval, y_eval = features.select_feature_target(df_eval)
+            X_train, y_train = features.select_feature_target(df)
             csv_stem = pathlib.Path(uploaded_file.name).stem.replace(" ", "_").lower()
             if model_choice == "RandomForest":
                 mdl, metrics = model_utils.train_random_forest(X_train, y_train, n_estimators=n_trees)
@@ -223,8 +260,10 @@ def main():
                 st.write("No saved models yet.")
                 eval_pressed = False
                 selected_model = None
+                horizon_days = 5
             else:
                 selected_model = st.selectbox("Model file", model_files)
+                horizon_days = st.slider("Horizon (days)", 1, 30, 5)
                 eval_pressed = st.button("Evaluate")
 
         if eval_pressed and selected_model:
@@ -236,39 +275,32 @@ def main():
                 df = cleaning.fill_missing(df)
                 df = features.create_time_features(df)
                 df = features.create_spatial_features(df)
-                df_train, df_eval = split_train_eval(df, horizon=5)
+                df_train, df_eval = split_train_eval(df, horizon=horizon_days)
                 X_train, y_train = features.select_feature_target(df_train)
                 X_eval, y_eval = features.select_feature_target(df_eval)
 
                 mdl = load_trained_model(MODELS_DIR / selected_model)
                 if mdl:
                     X_eval_aligned = X_eval.reindex(columns=X_train.columns, fill_value=0)
-                    if pred_mode == "Backtest":
-                        preds = model_utils.predict(mdl, X_eval_aligned)
-                        df_eval["predicted_temp"] = preds
-                        df_predplot_all = pd.concat([df_eval, df_train], ignore_index=True)
-                    else:
-                        future_df = make_future(df_train, horizon_days)
-                        X_future, _ = features.select_feature_target(future_df)
-                        X_future = X_future.reindex(columns=X_train.columns, fill_value=0)
-                        future_df["predicted_temp"] = model_utils.predict(mdl, X_future)
-                        df_predplot_all = future_df
+                    preds = model_utils.predict(mdl, X_eval_aligned)
+                    df_eval["predicted_temp"] = preds
+                    df_predplot_all = pd.concat([df_eval, df_train], ignore_index=True)
 
-                    # Compute metrics if ground truth available
-                    if "temperature_grain" in df.columns:
-                        mae = (df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs().mean()
-                        rmse = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]) ** 2).mean() ** 0.5
-                        st.caption(f"MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-                    else:
-                        st.info("Ground truth temperature_grain not found; showing predictions only.")
+                    # Compute metrics
+                    mae = (df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs().mean()
+                    rmse = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]) ** 2).mean() ** 0.5
+
+                    conf, acc = compute_overall_metrics(df_eval)
 
                     # Store results in session_state and acknowledge
-                    conf, acc = compute_overall_metrics(df_eval)
                     st.session_state["evaluations"][selected_model] = {
                         "df_eval": df_eval,
                         "df_predplot_all": df_predplot_all,
                         "confidence": conf,
                         "accuracy": acc,
+                        "rmse": rmse,
+                        "mae": mae,
+                        "horizon": horizon_days,
                     }
                     st.sidebar.success(f"Evaluation stored for {selected_model}.")
                 else:
@@ -283,8 +315,35 @@ def main():
                 res = st.session_state["evaluations"][tab_label]
                 df_eval = res["df_eval"]
                 df_predplot_all = res["df_predplot_all"]
-                day_choice = st.selectbox("Select forecast day", options=list(range(1,6)), key=f"day_{tab_label}")
-                df_predplot = df_predplot_all[df_predplot_all.get("forecast_day",1) == day_choice]
+                horizon_sel = int(res.get("horizon", 5))
+
+                # --- Quick metrics display (always visible) ---
+                conf_val = res.get("confidence", float("nan"))
+                # Handle legacy tuple storage
+                if isinstance(conf_val, tuple):
+                    conf_val = conf_val[0]
+                acc_val = res.get("accuracy", float("nan"))
+                # Handle legacy tuple storage
+                if isinstance(acc_val, tuple):
+                    acc_val = acc_val[1] if len(acc_val) > 1 else acc_val[0]
+                rmse_val = res.get("rmse", float("nan"))
+                mae_val = res.get("mae", float("nan"))
+
+                metric_cols = st.columns(4)
+                with metric_cols[0]:
+                    st.metric("Confidence (%)", "--" if pd.isna(conf_val) else f"{conf_val:.0f}")
+                    if not pd.isna(conf_val):
+                        st.progress(min(int(conf_val),100))
+                with metric_cols[1]:
+                    st.metric("Accuracy (%)", "--" if pd.isna(acc_val) else f"{acc_val:.1f}")
+                    if not pd.isna(acc_val):
+                        st.progress(min(int(acc_val),100))
+                with metric_cols[2]:
+                    st.metric("RMSE", "--" if pd.isna(rmse_val) else f"{rmse_val:.2f}")
+                with metric_cols[3]:
+                    st.metric("MAE", "--" if pd.isna(mae_val) else f"{mae_val:.2f}")
+                st.markdown("---")
+                # ------------------------------------------------
 
                 summary_tab, pred_tab, grid_tab, ts_tab = st.tabs(["Summary", "Predictions", "3D Grid", "Time Series"])
 
@@ -293,26 +352,19 @@ def main():
                         st.subheader("Forecast Summary (per day)")
                         st.dataframe(forecast_summary(df_eval), use_container_width=True)
 
-                        if {"temperature_grain", "predicted_temp"}.issubset(df_eval.columns):
-                            overall_r2 = r2_score(df_eval["temperature_grain"], df_eval["predicted_temp"])
-                            cols = st.columns(2)
-                            with cols[0]:
-                                st.metric("Overall Confidence (%)", f"{max(0, min(100, overall_r2 * 100)):.0f}")
-                            avg_pct_err = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs() / df_eval["temperature_grain"]).mean() * 100
-                            with cols[1]:
-                                st.metric("Overall Accuracy (%)", f"{max(0, 100 - avg_pct_err):.1f}")
-
-                            # Alert message collapsible
-                            with st.expander("Alerts", expanded=True):
-                                if (df_eval["predicted_temp"] >= ALERT_TEMP_THRESHOLD).any():
-                                    st.error("⚠️ High temperature forecast detected – monitor closely!")
-                                else:
-                                    st.success("No high-temperature alerts in forecast window")
+                        # Alert message collapsible
+                        with st.expander("Alerts", expanded=True):
+                            if (df_eval["predicted_temp"] >= ALERT_TEMP_THRESHOLD).any():
+                                st.error("⚠️ High temperature forecast detected – monitor closely!")
+                            else:
+                                st.success("No high-temperature alerts in forecast window")
 
                 with pred_tab:
-                    st.dataframe(df_predplot, use_container_width=True)
+                    st.dataframe(df_predplot_all, use_container_width=True)
 
                 with grid_tab:
+                    day_choice = st.selectbox("Select day", options=list(range(1, horizon_sel + 1)), key=f"day_{tab_label}_grid")
+                    df_predplot = df_predplot_all[df_predplot_all.get("forecast_day", 1) == day_choice]
                     plot_3d_grid(df_predplot, key=f"grid_{tab_label}")
 
                 with ts_tab:
