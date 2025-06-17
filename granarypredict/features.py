@@ -10,9 +10,37 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def create_time_features(df: pd.DataFrame, timestamp_col: str = "detection_time") -> pd.DataFrame:
-    """Add cyclical and calendar features from a timestamp column."""
+def create_time_features(
+    df: pd.DataFrame,
+    timestamp_col: str = "detection_time",
+) -> pd.DataFrame:
+    """Add cyclical and calendar features.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source frame.
+    timestamp_col : str, default "detection_time"
+        Name of the column that stores the timestamp.  If that column is missing
+        the function will try common alternatives (``timestamp``, ``datetime``,
+        ``date``, ``time``) before raising a ``KeyError``.
+    """
+
     df = df.copy()
+
+    # Auto-detect timestamp column if the default is missing
+    if timestamp_col not in df.columns:
+        common_alts = ["timestamp", "datetime", "date", "time"]
+        found_alt = next((c for c in common_alts if c in df.columns), None)
+        if found_alt is not None:
+            logger.info("create_time_features: using '%s' as timestamp column (auto-detected)", found_alt)
+            timestamp_col = found_alt
+        else:
+            raise KeyError(
+                f"Timestamp column '{timestamp_col}' not found in dataframe. "
+                "Add the column or pass the correct name via the 'timestamp_col' argument."
+            )
+
     df[timestamp_col] = pd.to_datetime(df[timestamp_col])
 
     df["year"] = df[timestamp_col].dt.year

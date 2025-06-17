@@ -47,9 +47,18 @@ feat_cols = list(model.feature_name_)       # LightGBM / RF / HistGB
 X_eval   = X_eval.reindex(columns=feat_cols,   fill_value=0)
 X_future = X_future.reindex(columns=feat_cols, fill_value=0)
 
-# ---------- 5. look at means / prediction comparison ----------
+# ---------- 5a. evaluation predictions & metrics ----------
+y_eval_pred = predict(model, X_eval)
+df_eval["predicted_temp"] = y_eval_pred
+mae_eval  = (df_eval["temperature_grain"] - df_eval["predicted_temp"]).abs().mean()
+rmse_eval = ((df_eval["temperature_grain"] - df_eval["predicted_temp"]) ** 2).mean() ** 0.5
+conf_eval, acc_eval = compute_overall_metrics(df_eval)
+print("\nEvaluation metrics:")
+print(f"MAE: {mae_eval:.2f}  RMSE: {rmse_eval:.2f}  Confidence: {conf_eval:.2f}%  Accuracy: {acc_eval:.2f}%")
+
+# ---------- 5b. look at means / prediction comparison ----------
 import numpy as np
-print("Column-wise mean difference:")
+print("\nColumn-wise mean difference (|Eval - Future|):")
 delta = (X_eval.mean() - X_future.mean()).abs().sort_values(ascending=False)
 print(delta.head(20))
 

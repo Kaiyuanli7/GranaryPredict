@@ -91,22 +91,54 @@ def fetch_company_data(
 
 def standardize_result147(df: pd.DataFrame) -> pd.DataFrame:
     """Convert Result_147.csv format to standard columns used in pipeline."""
+    # Column mapping for multiple export formats (Result_147 and the new StorePoint format)
     mapping = {
-        "batch": "detection_time",
-        "temp": "temperature_grain",
+        # ----- core timestamp / spatial / target -----
+        "batch": "detection_time",        # timestamp
+        "temp": "temperature_grain",     # target variable
         "x": "grid_x",
         "y": "grid_y",
         "z": "grid_z",
+
+        # ----- environmental variables -----
         "indoor_temp": "temperature_inside",
         "outdoor_temp": "temperature_outside",
         "indoor_humidity": "humidity_warehouse",
         "outdoor_humidity": "humidity_outside",
+
+        # ----- warehouse / grain metadata -----
         "storeType": "warehouse_type",
+
+        # ----- new StorePoint header additions -----
+        "storepoint_id": "storepoint_id",
+        "storepointName": "granary_id",
+        "storeName": "heap_id",
+        "kdjd": "longitude",            # 经度 (longitude)
+        "kdwd": "latitude",             # 纬度 (latitude)
+        "kqdz": "address_cn",           # 库区地址 (Chinese)
+        "storeId": "warehouse_id",
+        "locatType": "location_type",
+        "line_no": "line_no",
+        "layer_no": "layer_no",
+        "avg_in_temp": "avg_in_temp",
+        "max_temp": "max_temp",
+        "min_temp": "min_temp",
     }
     df = df.rename(columns=mapping)
     # ensure correct dtypes
     df["detection_time"] = pd.to_datetime(df["detection_time"])
-    nums = ["temperature_grain", "temperature_inside", "temperature_outside", "humidity_warehouse", "humidity_outside"]
+    nums = [
+        "temperature_grain",
+        "temperature_inside",
+        "temperature_outside",
+        "humidity_warehouse",
+        "humidity_outside",
+        "avg_in_temp",
+        "max_temp",
+        "min_temp",
+        "longitude",
+        "latitude",
+    ]
     for col in nums:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")

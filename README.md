@@ -2,6 +2,13 @@
 
 GranaryPredict is a lightweight end-to-end pipeline that ingests sensor data from grain warehouses, cleans & enriches it, trains a predictive model, and serves forecasts through an interactive Streamlit dashboard.
 
+> **What's New (May 2025)**  
+> • Supports the **StorePoint** CSV export format  
+> • Automatic mapping of new columns (`storepointName`, `storeName`, `kdjd`, `kdwd`, …)  
+> • Cascaded *Warehouse → Silo* selectors in the UI  
+> • Robust metric handling when some rows lack ground-truth temperatures  
+> • Utility script `scripts/fix_training_csv.py` to strip errant commas in legacy dumps
+
 ## Features
 1. Data ingestion from CSV or REST APIs
 2. Data cleaning & missing-value handling
@@ -10,9 +17,19 @@ GranaryPredict is a lightweight end-to-end pipeline that ingests sensor data fro
 5. 3-D grid visualization of silo temperatures
 6. Alerting when predicted temps exceed safe thresholds
 7. Time-series cross-validation and choice between RandomForest or HistGradientBoosting models
+8. Per-warehouse / per-silo evaluation & forecasts
 
 ## Project Structure
-Refer to `docs/PLAN.md`
+```
+granarypredict/       # Core Python package (ingestion, cleaning, features, modelling)
+app/                  # Streamlit dashboard – launch with `streamlit run app/Dashboard.py`
+data/
+  ├─ preloaded/       # Sample CSVs you can try immediately
+  ├─ raw/             # Original dumps (unchanged)
+  └─ processed/       # Cleaned CSVs (output of `fix_training_csv.py`)
+models/               # Saved models (.joblib) – auto-created
+scripts/              # Helper utilities (CSV fixer, synthetic data generator …)
+```
 
 ## Full Setup Guide (Windows cmd.exe)
 
@@ -57,8 +74,38 @@ Refer to `docs/PLAN.md`
    ```cmd
    streamlit run app\Dashboard.py
    ```
-   Open the displayed URL (usually http://localhost:8501). Use the sidebar to upload a CSV, choose a model, adjust
-   "Days ahead to predict", and train/evaluate.
+   The sidebar lets you:
+   1. Upload a CSV (or pick a bundled sample)
+   2. Train / retrain a model (choose algorithm + iterations)
+   3. **Select Warehouse → Silo** to focus on a single silo
+   4. Evaluate (back-test) or Forecast (future) with adjustable horizons
+
+## Working with StorePoint CSVs
+
+The latest export format has the header:
+
+```
+storepoint_id,storepointName,kdjd,kdwd,kqdz,storeId,storeName,locatType,line_no,layer_no,batch,temp,x,y,z,avg_in_temp,max_temp,min_temp,indoor_temp,indoor_humidity,outdoor_temp,outdoor_humidity,storeType
+```
+
+`granarypredict.ingestion.standardize_result147` automatically renames these fields to the internal names used by the pipeline:
+
+* `storepointName` → `granary_id`  (warehouse)
+* `storeName` → `heap_id`  (silo)
+* `kdjd` / `kdwd` → `longitude` / `latitude`
+* `kqdz` → `address_cn`
+
+So you don't need to alter the CSV – just upload it.
+
+### Cleaning legacy CSVs
+
+If you have older dumps where every line starts with an extra comma, run:
+
+```cmd
+python scripts\fix_training_csv.py -i data\preloaded\TrainingData.csv -o data\processed\TrainingData_fixed.csv
+```
+
+Then upload the fixed file.
 
 ### PowerShell differences
 • Use `Activate.ps1` instead of `activate.bat` to enable the venv.  
