@@ -97,14 +97,6 @@ storepoint_id,storepointName,kdjd,kdwd,kqdz,storeId,storeName,locatType,line_no,
 
 So you don't need to alter the CSV – just upload it.
 
-### Cleaning legacy CSVs
-
-If you have older dumps where every line starts with an extra comma, run:
-
-```cmd
-python scripts\fix_training_csv.py -i data\preloaded\TrainingData.csv -o data\processed\TrainingData_fixed.csv
-```
-
 Then upload the fixed file.
 
 ### PowerShell differences
