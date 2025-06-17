@@ -45,7 +45,7 @@ PRESET_HORIZONS = [7, 14, 30, 90, 180, 365]
 def is_future_safe_model(model_name: str) -> bool:
     return "fs_" in model_name.lower()
 
-st.set_page_config(page_title="GranaryPredict", layout="wide")
+st.set_page_config(page_title="SiloFlow", layout="wide")
 
 
 

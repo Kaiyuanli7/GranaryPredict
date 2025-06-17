@@ -1,10 +1,10 @@
-# 🌾 GranaryPredict
+# 🛢️ SiloFlow
 
-GranaryPredict is a lightweight end-to-end pipeline that ingests sensor data from grain warehouses, cleans & enriches it, trains a predictive model, and serves forecasts through an interactive Streamlit dashboard.
+SiloFlow is a lightweight end-to-end pipeline that ingests sensor data from grain warehouses, cleans & enriches it, trains a predictive model, and serves forecasts through an interactive Streamlit dashboard.
 
 > **What's New (May 2025)**  
+> • Project renamed to **SiloFlow** (imports remain backward-compatible via an alias).  
 > • Supports the **StorePoint** CSV export format  
-> • Automatic mapping of new columns (`storepointName`, `storeName`, `kdjd`, `kdwd`, …)  
 > • Cascaded *Warehouse → Silo* selectors in the UI  
 > • Robust metric handling when some rows lack ground-truth temperatures  
 > • Utility script `scripts/fix_training_csv.py` to strip errant commas in legacy dumps
