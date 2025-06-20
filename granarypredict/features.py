@@ -109,6 +109,8 @@ def select_feature_target(
 # Keep exports alphabetical for readability
 __all__ = [
     "add_sensor_lag",
+    "add_multi_lag",
+    "add_rolling_stats",
     "create_spatial_features",
     "create_time_features",
     "encode_categoricals",
@@ -165,5 +167,97 @@ def add_sensor_lag(
     df = df.merge(lag_df, on=lag_key_cols, how="left")
 
     df.drop(columns=["_date"], inplace=True)
+
+    return df 
+
+
+# ---------------------------------------------------------------------------
+# NEW – Extra temperature features (May-2025)
+# ---------------------------------------------------------------------------
+
+
+def _add_single_lag(df: pd.DataFrame, lag_days: int, *,
+                    temp_col: str = "temperature_grain",
+                    timestamp_col: str = "detection_time") -> pd.DataFrame:
+    """Return *df* with a new column ``lag_temp_<lag>d`` computed exactly like
+    ``add_sensor_lag`` but for an arbitrary day offset."""
+
+    if lag_days == 1:
+        # Already handled by original add_sensor_lag; skip duplication.
+        return df
+
+    if {"grid_x", "grid_y", "grid_z", temp_col, timestamp_col}.issubset(df.columns):
+        df = df.copy()
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+
+        group_cols = [c for c in ["granary_id", "heap_id", "grid_x", "grid_y", "grid_z"] if c in df.columns]
+        df["_date"] = df[timestamp_col].dt.floor("D")
+
+        lag_df = df[group_cols + ["_date", temp_col]].copy()
+        lag_df["_date"] = lag_df["_date"] + pd.Timedelta(days=lag_days)
+        lag_df.rename(columns={temp_col: f"lag_temp_{lag_days}d"}, inplace=True)
+
+        df = df.merge(lag_df, on=group_cols + ["_date"], how="left")
+        df.drop(columns=["_date"], inplace=True)
+    return df
+
+
+def add_multi_lag(
+    df: pd.DataFrame,
+    *,
+    lags: tuple[int, ...] = (1, 7, 30),
+    temp_col: str = "temperature_grain",
+    timestamp_col: str = "detection_time",
+) -> pd.DataFrame:
+    """Add multiple lag columns (e.g. 1-, 7-, 30-day) and ΔT feature.
+
+    Relies on ``add_sensor_lag`` for the 1-day lag and `_add_single_lag` for
+    longer offsets.
+    """
+
+    df = add_sensor_lag(df, temp_col=temp_col, timestamp_col=timestamp_col)
+    for d in lags:
+        if d == 1:
+            continue
+        df = _add_single_lag(df, d, temp_col=temp_col, timestamp_col=timestamp_col)
+
+    # ΔT = current − 1-day lag
+    if temp_col in df.columns and "lag_temp_1d" in df.columns:
+        df["delta_temp_1d"] = df[temp_col] - df["lag_temp_1d"]
+    return df
+
+
+def add_rolling_stats(
+    df: pd.DataFrame,
+    *,
+    window_days: int = 7,
+    temp_col: str = "temperature_grain",
+    timestamp_col: str = "detection_time",
+) -> pd.DataFrame:
+    """Add rolling mean and std of *temp_col* over *window_days* for each sensor."""
+
+    if not {temp_col, timestamp_col}.issubset(df.columns):
+        return df
+
+    df = df.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df.sort_values(timestamp_col, inplace=True)
+
+    group_cols = [c for c in ["granary_id", "heap_id", "grid_x", "grid_y", "grid_z"] if c in df.columns]
+    roll_mean_col = f"roll_mean_{window_days}d"
+    roll_std_col = f"roll_std_{window_days}d"
+
+    if group_cols:
+        df[roll_mean_col] = (
+            df.groupby(group_cols)[temp_col]
+            .transform(lambda s: s.rolling(window_days, min_periods=1).mean())
+        )
+        df[roll_std_col] = (
+            df.groupby(group_cols)[temp_col]
+            .transform(lambda s: s.rolling(window_days, min_periods=1).std())
+        )
+    else:
+        df[roll_mean_col] = df[temp_col].rolling(window_days, min_periods=1).mean()
+        df[roll_std_col] = df[temp_col].rolling(window_days, min_periods=1).std()
 
     return df 

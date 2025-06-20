@@ -1026,6 +1026,10 @@ def generate_and_store_forecast(model_name: str, horizon: int) -> bool:
         day_df = _inject_future_lag(day_df, hist_df)
         day_df["forecast_day"] = d
 
+        # Extra features (lags, rolling) before encoding
+        day_df = features.add_multi_lag(day_df, lags=(1,7,30))
+        day_df = features.add_rolling_stats(day_df, window_days=7)
+
         # Apply categories levels
         for col, cats in categories_map.items():
             if col in day_df.columns:
@@ -1134,6 +1138,14 @@ def _preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     _d("assign_group_id: _group_id column added to dataframe")
     df = comprehensive_sort(df)
     _d("comprehensive_sort: dataframe sorted by granary/heap/grid/date")
+
+    # -------------------------------------------------------------
+    # 4️⃣ Extra temperature features (multi-lag, rolling stats, delta)
+    # -------------------------------------------------------------
+    df = features.add_multi_lag(df, lags=(1,7,30))
+    df = features.add_rolling_stats(df, window_days=7)
+    _d("add_multi_lag & add_rolling_stats: extra features added")
+
     return df
 
 
@@ -1208,10 +1220,9 @@ def _get_active_df(uploaded_file):
 # Helper to fetch whichever DataFrame (raw/organised) is active & processed
 # ---------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Running full preprocessing…")
 def _preprocess_cached(df: pd.DataFrame) -> pd.DataFrame:
-    """Cached version of the full preprocessing pipeline."""
-    _d("⚙️ _preprocess_cached: CACHE MISS → executing heavy pipeline")
+    """Wrapper around the heavy preprocessing pipeline (no Streamlit caching – we persist processed CSVs instead)."""
+    _d("⚙️ _preprocess_cached: running full pipeline (no Streamlit cache)")
     return _preprocess_df(df)
 
 def _get_preprocessed_df(uploaded_file):
