@@ -266,6 +266,39 @@ def split_train_eval(df: pd.DataFrame, horizon: int = 5):
     return df_train, df_eval
 
 
+# -------------------------------------------------------------------
+# NEW – fraction‐based chronological split (May-2025)
+# -------------------------------------------------------------------
+
+
+def split_train_eval_frac(df: pd.DataFrame, test_frac: float = 0.2):
+    """Chronologically split *df* by unique date where the **last** fraction
+    (``test_frac``) of dates becomes the evaluation set.
+
+    Returns (df_train, df_eval) similar to ``split_train_eval`` but sized by
+    proportion instead of fixed horizon.
+    """
+    df = df.copy()
+    df["_date"] = pd.to_datetime(df["detection_time"]).dt.date
+    unique_dates = sorted(df["_date"].unique())
+    if not unique_dates:
+        return df, pd.DataFrame()
+
+    n_test_days = max(1, int(len(unique_dates) * test_frac))
+    cutoff_dates = unique_dates[-n_test_days:]
+
+    df_eval = df[df["_date"].isin(cutoff_dates)].copy()
+    df_train = df[~df["_date"].isin(cutoff_dates)].copy()
+
+    # map forecast_day index 1..n_test_days
+    date_to_idx = {date: idx for idx, date in enumerate(cutoff_dates, start=1)}
+    df_eval["forecast_day"] = df_eval["_date"].map(date_to_idx)
+
+    df_train.drop(columns=["_date"], inplace=True)
+    df_eval.drop(columns=["_date"], inplace=True)
+    return df_train, df_eval
+
+
 def forecast_summary(df_eval: pd.DataFrame) -> pd.DataFrame:
     if "forecast_day" not in df_eval.columns:
         return pd.DataFrame()
@@ -529,20 +562,12 @@ def main():
 
                 # -------- Group-aware hold-out with user-defined split --------
                 _d("Preparing train/test split…")
-                if "_group_id" in df.columns and df["_group_id"].nunique() > 1 and len(df) > 10:
-                    groups_all = df["_group_id"]
-                    splitter_eval = GroupShuffleSplit(n_splits=1, test_size=max(0.01, 1 - train_pct / 100), random_state=42)
-                    tr_idx, te_idx = next(splitter_eval.split(df, groups=groups_all))
-                    X_tr, y_tr = X_all.iloc[tr_idx], y_all.iloc[tr_idx]
-                    X_te, y_te = X_all.iloc[te_idx], y_all.iloc[te_idx]
-                    perform_validation = True
-                    _d(f"Train rows: {len(X_tr)}  | Test rows: {len(X_te)}")
-                else:
-                    # Fallback: chronological split – last 1 date as test
-                    df_train_tmp, df_eval_tmp = split_train_eval(df, horizon=1)
-                    X_tr, y_tr = features.select_feature_target(df_train_tmp, target_col=TARGET_TEMP_COL)
-                    X_te, y_te = features.select_feature_target(df_eval_tmp, target_col=TARGET_TEMP_COL)
-                    perform_validation = not X_te.empty
+                # Chronological split by date proportion
+                test_frac_chrono = max(0.01, 1 - train_pct / 100)
+                df_train_tmp, df_eval_tmp = split_train_eval_frac(df, test_frac=test_frac_chrono)
+                X_tr, y_tr = features.select_feature_target(df_train_tmp, target_col=TARGET_TEMP_COL)
+                X_te, y_te = features.select_feature_target(df_eval_tmp, target_col=TARGET_TEMP_COL)
+                perform_validation = not X_te.empty
 
                 # -------- Model selection & training --------
                 if model_choice == "RandomForest":
@@ -613,17 +638,10 @@ def main():
                     # Use same train/test split fraction recorded during training (default 20%)
                     test_frac = max(0.01, 1 - st.session_state.get("last_train_pct", 80)/100)
 
-                    # ---------- Group split (same logic as training) ----------
-                    if "_group_id" in df.columns and df["_group_id"].nunique() > 1 and len(df) > 10:
-                        groups_all = df["_group_id"]
-                        splitter_eval = GroupShuffleSplit(n_splits=1, test_size=test_frac, random_state=42)
-                        tr_idx, te_idx = next(splitter_eval.split(df, groups=groups_all))
-                        df_train_base = df.iloc[tr_idx].copy()
-                        df_eval_base = df.iloc[te_idx].copy()
-                        _d(f"Evaluation split – train rows: {len(df_train_base)}, test rows: {len(df_eval_base)}")
-                    else:
-                        # Fallback: simple chronological split by date
-                        df_train_base, df_eval_base = split_train_eval(df, horizon=5)
+                    # ---------- Chronological split (proportional) ----------
+                    df_train_base, df_eval_base = split_train_eval_frac(df, test_frac=test_frac)
+                    _d(f"Evaluation split – train rows: {len(df_train_base)}, test rows: {len(df_eval_base)}")
+                    use_gap_fill = False  # skip calendar gap generation – evaluate only real rows
 
                     X_train_base, _ = features.select_feature_target(df_train_base, target_col=TARGET_TEMP_COL)
 
@@ -657,7 +675,7 @@ def main():
                         # Assign only to rows actually used in prediction (no-length mismatch)
                         df_eval.loc[X_eval_aligned.index, "predicted_temp"] = preds
                         df_eval["is_forecast"] = False
-                        # mark evaluation rows
+                        # Combine training (actual only) and evaluation rows for full context time-series
                         df_train_plot = df_train.copy()
                         df_train_plot["is_forecast"] = False
                         df_predplot_all = pd.concat([df_eval, df_train_plot], ignore_index=True)
@@ -670,7 +688,7 @@ def main():
                         else:
                             missing_dates_actual = set()
 
-                        if missing_dates_actual:
+                        if use_gap_fill and missing_dates_actual:
                             # Determine a minimal sensor signature (spatial + id columns).
                             sensor_cols = [c for c in ["grid_x","grid_y","grid_z","granary_id","heap_id"] if c in df_train.columns]
                             if sensor_cols:
@@ -694,6 +712,50 @@ def main():
                             for col, cats in categories_map.items():
                                 if col in gap_df.columns:
                                     gap_df[col] = pd.Categorical(gap_df[col], categories=cats)
+
+                            # ----------------------------------------------------
+                            # Enrich gap_df with lag feature and mean-filled cols
+                            # ----------------------------------------------------
+
+                            # Add lag_temp_1d using most recent history (training set)
+                            gap_df = _inject_future_lag(gap_df, df_train)
+
+                            # Mean values from the *training* data for numeric cols
+                            num_means = df_train.select_dtypes(include=["number"]).mean()
+
+                            for feat in feature_cols_mdl:
+                                if feat not in gap_df.columns:
+                                    # Create column with mean if numeric, else NaN (will be encoded)
+                                    if feat in num_means.index:
+                                        gap_df[feat] = num_means[feat]
+                                    else:
+                                        gap_df[feat] = np.nan
+                                else:
+                                    # Fill NaNs within existing numeric columns
+                                    if pd.api.types.is_numeric_dtype(gap_df[feat]):
+                                        gap_df[feat] = gap_df[feat].fillna(num_means.get(feat, 0))
+
+                            # Ensure ALL columns from training data exist and are populated
+                            for col in df_train.columns:
+                                if col not in gap_df.columns:
+                                    if pd.api.types.is_numeric_dtype(df_train[col]):
+                                        gap_df[col] = num_means.get(col, 0)
+                                    else:
+                                        # Use most frequent (mode) or NaN
+                                        mode_val = df_train[col].mode(dropna=True)
+                                        gap_df[col] = mode_val.iloc[0] if not mode_val.empty else np.nan
+                                else:
+                                    # Fill NaNs inside existing categorical/object columns with mode
+                                    if gap_df[col].isna().any() and not pd.api.types.is_numeric_dtype(gap_df[col]):
+                                        mode_val = df_train[col].mode(dropna=True)
+                                        if not mode_val.empty:
+                                            gap_df[col] = gap_df[col].fillna(mode_val.iloc[0])
+
+                            # Guarantee target columns exist before feature selection to avoid KeyError
+                            if TARGET_TEMP_COL not in gap_df.columns:
+                                gap_df[TARGET_TEMP_COL] = np.nan
+                            if "temperature_grain" not in gap_df.columns:
+                                gap_df["temperature_grain"] = np.nan
 
                             X_gap, _ = features.select_feature_target(gap_df, target_col=TARGET_TEMP_COL)
                             X_gap_aligned = X_gap.reindex(columns=feature_cols_mdl, fill_value=0)
@@ -823,6 +885,16 @@ def render_evaluation(model_name: str):
     categories_map = res.get("categories_map", {})
     df_eval = res["df_eval"]
     df_predplot_all = res["df_predplot_all"]
+
+    # Ensure 'forecast_day' exists for downstream UI widgets
+    if "forecast_day" not in df_eval.columns and "detection_time" in df_eval.columns:
+        date_series = pd.to_datetime(df_eval["detection_time"]).dt.floor("D")
+        unique_dates_sorted = sorted(date_series.unique())
+        date2idx = {d: idx for idx, d in enumerate(unique_dates_sorted, start=1)}
+        df_eval["forecast_day"] = date_series.map(date2idx)
+        # Apply same mapping to the combined prediction frame if present
+        if "detection_time" in df_predplot_all.columns:
+            df_predplot_all["forecast_day"] = pd.to_datetime(df_predplot_all["detection_time"]).dt.floor("D").map(date2idx)
 
     # ---------------- Warehouse → Silo cascading filters -----------------
     wh_col_candidates = [c for c in ["granary_id", "storepointName"] if c in df_eval.columns]
@@ -1127,6 +1199,9 @@ def _preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     df = features.add_sensor_lag(df)
     after_lag_na = df["lag_temp_1d"].isna().sum() if "lag_temp_1d" in df.columns else 0
     _d(f"add_sensor_lag: lag NaNs={after_lag_na} (target NaNs before={before_lag_na})")
+    # Ensure group identifiers available for downstream splitting/evaluation
+    df = assign_group_id(df)
+    _d("assign_group_id: _group_id column added to dataframe")
     df = comprehensive_sort(df)
     _d("comprehensive_sort: dataframe sorted by granary/heap/grid/date")
     return df
