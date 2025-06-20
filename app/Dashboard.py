@@ -482,8 +482,8 @@ def main():
                         st.warning(f"Could not organise mixed CSV: {exc}")
 
         # Full preprocessing once
-        _d("Running full preprocessing on uploaded dataframe…")
-        df = _preprocess_df(df)
+        _d("Running full preprocessing on uploaded dataframe (cached)…")
+        df = _get_preprocessed_df(uploaded_file)
         _d(f"Preprocessed dataframe shape: {df.shape}")
 
         # Display sorted table directly below Raw Data
@@ -679,94 +679,6 @@ def main():
                         df_train_plot = df_train.copy()
                         df_train_plot["is_forecast"] = False
                         df_predplot_all = pd.concat([df_eval, df_train_plot], ignore_index=True)
-
-                        # -------- Fill CALENDAR gaps (missing actual dates) within evaluation window --------
-                        eval_dates = pd.to_datetime(df_eval["detection_time"]).dt.floor("D")
-                        if not eval_dates.empty:
-                            full_range = pd.date_range(eval_dates.min(), eval_dates.max(), freq="D")
-                            missing_dates_actual = set(full_range.date) - set(eval_dates.dt.date.unique())
-                        else:
-                            missing_dates_actual = set()
-
-                        if use_gap_fill and missing_dates_actual:
-                            # Determine a minimal sensor signature (spatial + id columns).
-                            sensor_cols = [c for c in ["grid_x","grid_y","grid_z","granary_id","heap_id"] if c in df_train.columns]
-                            if sensor_cols:
-                                sensors_base = df_train[sensor_cols].drop_duplicates().reset_index(drop=True)
-                            else:
-                                # Fallback: use a single representative row without the target/label columns
-                                sensors_base = df_train.drop(columns=[col for col in ["temperature_grain","predicted_temp","is_forecast"] if col in df_train.columns]).head(1).reset_index(drop=True)
-
-                            gap_frames = []
-                            for md in sorted(missing_dates_actual):
-                                tmp_gap = sensors_base.copy()
-                                tmp_gap["detection_time"] = pd.to_datetime(md)
-                                gap_frames.append(tmp_gap)
-
-                            gap_df = pd.concat(gap_frames, ignore_index=True)
-                            gap_df = features.create_time_features(gap_df)
-                            gap_df = features.create_spatial_features(gap_df)
-                            # add forecast_day relative index for plotting order
-                            gap_df["forecast_day"] = (gap_df["detection_time"].dt.floor("D") - eval_dates.min()).dt.days + 1
-
-                            for col, cats in categories_map.items():
-                                if col in gap_df.columns:
-                                    gap_df[col] = pd.Categorical(gap_df[col], categories=cats)
-
-                            # ----------------------------------------------------
-                            # Enrich gap_df with lag feature and mean-filled cols
-                            # ----------------------------------------------------
-
-                            # Add lag_temp_1d using most recent history (training set)
-                            gap_df = _inject_future_lag(gap_df, df_train)
-
-                            # Mean values from the *training* data for numeric cols
-                            num_means = df_train.select_dtypes(include=["number"]).mean()
-
-                            for feat in feature_cols_mdl:
-                                if feat not in gap_df.columns:
-                                    # Create column with mean if numeric, else NaN (will be encoded)
-                                    if feat in num_means.index:
-                                        gap_df[feat] = num_means[feat]
-                                    else:
-                                        gap_df[feat] = np.nan
-                                else:
-                                    # Fill NaNs within existing numeric columns
-                                    if pd.api.types.is_numeric_dtype(gap_df[feat]):
-                                        gap_df[feat] = gap_df[feat].fillna(num_means.get(feat, 0))
-
-                            # Ensure ALL columns from training data exist and are populated
-                            for col in df_train.columns:
-                                if col not in gap_df.columns:
-                                    if pd.api.types.is_numeric_dtype(df_train[col]):
-                                        gap_df[col] = num_means.get(col, 0)
-                                    else:
-                                        # Use most frequent (mode) or NaN
-                                        mode_val = df_train[col].mode(dropna=True)
-                                        gap_df[col] = mode_val.iloc[0] if not mode_val.empty else np.nan
-                                else:
-                                    # Fill NaNs inside existing categorical/object columns with mode
-                                    if gap_df[col].isna().any() and not pd.api.types.is_numeric_dtype(gap_df[col]):
-                                        mode_val = df_train[col].mode(dropna=True)
-                                        if not mode_val.empty:
-                                            gap_df[col] = gap_df[col].fillna(mode_val.iloc[0])
-
-                            # Guarantee target columns exist before feature selection to avoid KeyError
-                            if TARGET_TEMP_COL not in gap_df.columns:
-                                gap_df[TARGET_TEMP_COL] = np.nan
-                            if "temperature_grain" not in gap_df.columns:
-                                gap_df["temperature_grain"] = np.nan
-
-                            X_gap, _ = features.select_feature_target(gap_df, target_col=TARGET_TEMP_COL)
-                            X_gap_aligned = X_gap.reindex(columns=feature_cols_mdl, fill_value=0)
-                            preds_gap = model_utils.predict(mdl, X_gap_aligned)
-                            gap_df["predicted_temp"] = preds_gap
-                            gap_df["temperature_grain"] = np.nan
-                            gap_df[TARGET_TEMP_COL] = np.nan
-                            gap_df["is_forecast"] = True
-
-                            df_predplot_all = pd.concat([df_predplot_all, gap_df], ignore_index=True)
-                            df_eval = pd.concat([df_eval, gap_df], ignore_index=True)
 
                         # metrics
                         df_eval_actual = df_eval[df_eval[TARGET_TEMP_COL].notna()].copy()
@@ -1187,10 +1099,28 @@ def _preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     before_cols = list(df.columns)
     df = cleaning.basic_clean(df)
     _d(f"basic_clean: cols before={len(before_cols)} after={len(df.columns)} rows={len(df)}")
+
+    # -------------------------------------------------------------
+    # 1️⃣ Insert missing calendar-day rows first
+    # -------------------------------------------------------------
+    df = _insert_calendar_gaps(df)
+    _d("insert_calendar_gaps: added rows for missing dates")
+
+    # -------------------------------------------------------------
+    # 2️⃣ Interpolate numeric columns per sensor across the now-complete
+    #    timeline so gap rows take the average of surrounding real values.
+    # -------------------------------------------------------------
+    df = _interpolate_sensor_numeric(df)
+    _d("_interpolate_sensor_numeric: linear interpolation applied per sensor")
+
+    # -------------------------------------------------------------
+    # 3️⃣ Final fill_missing to tidy up any residual NaNs (categoricals etc.)
+    # -------------------------------------------------------------
     na_before = df.isna().sum().sum()
     df = cleaning.fill_missing(df)
     na_after = df.isna().sum().sum()
-    _d(f"fill_missing: total NaNs before={na_before} after={na_after}")
+    _d(f"fill_missing (final): total NaNs before={na_before} after={na_after}")
+
     df = features.create_time_features(df)
     _d("create_time_features: added year/month/day/hour cols")
     df = features.create_spatial_features(df)
@@ -1208,6 +1138,62 @@ def _preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------
+# Helper: insert rows for missing calendar dates per sensor
+# ---------------------------------------------------------------------
+
+def _insert_calendar_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Return *df* where any missing *calendar days* for each sensor are
+    back-filled with synthetic rows so models see a continuous timeline.
+
+    • Sensor grouping columns: granary_id, heap_id, grid_x/y/z (subset present).
+    • For each missing date, copies the most recent known row for that sensor
+      and nulls out numeric, non-static measurement columns so they can be
+      filled later (mean, ffill etc.).
+    """
+    if "detection_time" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["detection_time"] = pd.to_datetime(df["detection_time"], errors="coerce")
+
+    group_cols = [c for c in ["granary_id", "heap_id", "grid_x", "grid_y", "grid_z"] if c in df.columns]
+    if not group_cols:
+        group_cols = []  # treat whole frame as one group
+
+    frames = [df]
+
+    # Helper to decide which numeric cols are *measurements* (varying) vs static
+    static_like = set(group_cols + ["granary_id", "heap_id", "grain_type", "warehouse_type"])  # do not null
+
+    for key, sub in df.groupby(group_cols) if group_cols else [(None, df)]:
+        sub = sub.sort_values("detection_time")
+        date_floor = sub["detection_time"].dt.floor("D")
+        full_range = pd.date_range(date_floor.min(), date_floor.max(), freq="D")
+        missing_dates = sorted(set(full_range.date) - set(date_floor.dt.date.unique()))
+        if not missing_dates:
+            continue
+
+        # Use last known row as template (static cols correct)
+        template = sub.iloc[-1].copy()
+
+        new_rows = []
+        for md in missing_dates:
+            row = template.copy()
+            row["detection_time"] = pd.Timestamp(md)
+            # Null out non-static numeric columns to be filled later
+            for col in df.select_dtypes(include=[np.number]).columns:
+                if col not in static_like:
+                    row[col] = np.nan
+            new_rows.append(row)
+
+        if new_rows:
+            frames.append(pd.DataFrame(new_rows))
+
+    df_full = pd.concat(frames, ignore_index=True)
+    return df_full
+
+
+# ---------------------------------------------------------------------
 # Helper to fetch raw (possibly organised) dataframe
 # ---------------------------------------------------------------------
 
@@ -1222,12 +1208,52 @@ def _get_active_df(uploaded_file):
 # Helper to fetch whichever DataFrame (raw/organised) is active & processed
 # ---------------------------------------------------------------------
 
+@st.cache_data(show_spinner="Running full preprocessing…")
+def _preprocess_cached(df: pd.DataFrame) -> pd.DataFrame:
+    """Cached version of the full preprocessing pipeline."""
+    _d("⚙️ _preprocess_cached: CACHE MISS → executing heavy pipeline")
+    return _preprocess_df(df)
+
 def _get_preprocessed_df(uploaded_file):
     """Return a fully-preprocessed dataframe (cached in session)."""
-    if st.session_state.get("processed_df") is not None:
-        return st.session_state["processed_df"].copy()
+    # --------------------------------------------------------
+    # 0️⃣ Fast-path: if the uploaded file is already a processed
+    #    CSV (name ends with _processed.csv or resides in data/processed),
+    #    simply load and return it.
+    # --------------------------------------------------------
+    if _looks_processed(uploaded_file):
+        try:
+            _d("✅ Detected preprocessed CSV – loading directly, skipping heavy pipeline")
+            df_fast = pd.read_csv(uploaded_file, encoding="utf-8") if isinstance(uploaded_file, (str, pathlib.Path)) else pd.read_csv(uploaded_file.name, encoding="utf-8")
+            st.session_state["processed_df"] = df_fast.copy()
+            return df_fast
+        except Exception as exc:
+            _d(f"⚠️ Could not load preprocessed CSV fast-path: {exc}; falling back to pipeline")
+
     raw_df = _get_active_df(uploaded_file)
-    proc = _preprocess_df(raw_df)
+
+    # Use cached preprocessing to avoid repeating heavy work across reruns
+    proc = _preprocess_cached(raw_df)
+    _d("🔄 Received dataframe from _preprocess_cached (may be cache hit or miss)")
+
+    # --------------------------------------------------------
+    # Persist a processed CSV alongside others for future fast-path
+    # --------------------------------------------------------
+    try:
+        if hasattr(uploaded_file, "name"):
+            orig_name = pathlib.Path(uploaded_file.name).stem
+        else:
+            orig_name = pathlib.Path(uploaded_file).stem if isinstance(uploaded_file, (str, pathlib.Path)) else "uploaded"
+
+        processed_dir = pathlib.Path("data/processed")
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = processed_dir / f"{orig_name}_processed.csv"
+        if not out_csv.exists():
+            proc.to_csv(out_csv, index=False, encoding="utf-8")
+            _d(f"💾 Saved processed CSV to {out_csv}")
+    except Exception as exc:
+        _d(f"⚠️ Could not persist processed CSV: {exc}")
+
     st.session_state["processed_df"] = proc.copy()
     return proc
 
@@ -1261,6 +1287,39 @@ def _looks_processed(upload):
         if name.endswith("_processed.csv"):
             return True
     return False
+
+
+# ---------------------------------------------------------------------
+# Helper: numeric interpolation per sensor across calendar-completed frame
+# ---------------------------------------------------------------------
+
+def _interpolate_sensor_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """For each sensor group, linearly interpolate numeric columns along
+    chronological order so values for synthetic gap rows equal the average of
+    previous and next real measurements."""
+
+    if "detection_time" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["detection_time"] = pd.to_datetime(df["detection_time"], errors="coerce")
+    df.sort_values("detection_time", inplace=True)
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        return df
+
+    group_cols = [c for c in ["granary_id", "heap_id", "grid_x", "grid_y", "grid_z"] if c in df.columns]
+    if group_cols:
+        df[num_cols] = (
+            df.groupby(group_cols)[num_cols]
+            .apply(lambda g: g.interpolate(method="linear").ffill().bfill())
+            .reset_index(level=group_cols, drop=True)
+        )
+    else:
+        df[num_cols] = df[num_cols].interpolate(method="linear").ffill().bfill()
+
+    return df
 
 
 if __name__ == "__main__":
